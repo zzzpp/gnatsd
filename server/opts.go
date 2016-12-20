@@ -12,16 +12,31 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/gnatsd/conf"
 )
+
+type rateInfo struct {
+	msgs      int64
+	bytes     int64
+	checkID   uint64
+	mu        sync.Mutex
+	lastCheck int64
+	maxMsgs   int64
+	maxBytes  int64
+}
 
 // For multiple accounts/users.
 type User struct {
 	Username    string       `json:"user"`
 	Password    string       `json:"password"`
 	Permissions *Permissions `json:"permissions"`
+	MsgRate     int          `json:"msg_rate"`
+
+	// not exported
+	rate rateInfo
 }
 
 // Authorization are the allowed subjects on a per
@@ -399,6 +414,10 @@ func parseUsers(mv interface{}) ([]*User, error) {
 					return nil, err
 				}
 				user.Permissions = permissions
+			case "msg_rate":
+				user.MsgRate = int(v.(int64))
+				user.rate.maxMsgs = v.(int64)
+				user.rate.maxBytes = v.(int64) * 512
 			}
 		}
 		// Check to make sure we have at least username and password

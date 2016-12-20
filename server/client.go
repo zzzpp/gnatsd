@@ -109,6 +109,10 @@ type client struct {
 	last  time.Time
 	parseState
 
+	doRate   bool
+	rate     *rateInfo
+	rateQuit chan struct{}
+
 	route *route
 	debug bool
 	trace bool
@@ -211,13 +215,32 @@ func (c *client) initClient() {
 // with the authenticated user. This is used to map any permissions
 // into the client.
 func (c *client) RegisterUser(user *User) {
-	if user.Permissions == nil {
+	if user.Permissions == nil && user.rate.maxMsgs == 0 {
 		return
 	}
 
-	// Process Permissions and map into client connection structures.
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Check User's rate limit
+	if user.MsgRate != 0 {
+		// This is normally updated when processing the configuration file.
+		user.rate.mu.Lock()
+		if user.rate.maxMsgs == 0 {
+			user.rate.maxMsgs = int64(user.MsgRate)
+			user.rate.maxBytes = user.rate.maxMsgs * 512
+		}
+		user.rate.mu.Unlock()
+		c.doRate = true
+		c.rate = &user.rate
+		c.rateQuit = make(chan struct{}, 1)
+	}
+
+	// If no permission, we are done
+	if user.Permissions == nil {
+		return
+	}
+	// Process Permissions and map into client connection structures.
 
 	// Pre-allocate all to simplify checks later.
 	c.perms = &permissions{}
@@ -980,8 +1003,9 @@ func (c *client) processMsg(msg []byte) {
 
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.
-	c.cache.inMsgs += 1
-	c.cache.inBytes += len(msg) - LEN_CR_LF
+	msgSize := len(msg) - LEN_CR_LF
+	c.cache.inMsgs++
+	c.cache.inBytes += msgSize
 
 	if c.trace {
 		c.traceMsg(msg)
@@ -1030,6 +1054,10 @@ func (c *client) processMsg(msg []byte) {
 				return
 			}
 		}
+	}
+
+	if c.doRate {
+		c.doRateControl(int64(msgSize))
 	}
 
 	if c.opts.Verbose {
@@ -1141,6 +1169,9 @@ func (c *client) processMsg(msg []byte) {
 		// Normal delivery
 		mh := c.msgHeader(msgh[:si], sub)
 		c.deliverMsg(sub, mh, msg)
+		if sub.client != nil && sub.client.doRate {
+			sub.client.doRateControl(int64(msgSize))
+		}
 	}
 
 	// Now process any queue subs we have if not a route
@@ -1158,7 +1189,56 @@ func (c *client) processMsg(msg []byte) {
 			if sub != nil {
 				mh := c.msgHeader(msgh[:si], sub)
 				c.deliverMsg(sub, mh, msg)
+				if sub.client != nil && sub.client.doRate {
+					sub.client.doRateControl(int64(msgSize))
+				}
 			}
+		}
+	}
+}
+
+// doRateControl adds the given message to the User's rate accounting.
+// If threshold is reached, this call blocks for the remainig of the
+// second. Other clients for same user will also block (due to use
+// of User's mutex) which ensure User's global rate limiting.
+func (c *client) doRateControl(msgSize int64) {
+	r := c.rate
+	id := atomic.LoadUint64(&r.checkID)
+	msgs := atomic.AddInt64(&r.msgs, 1)
+	bytes := atomic.AddInt64(&r.bytes, msgSize)
+	if atomic.LoadInt64(&r.lastCheck) == 0 {
+		r.mu.Lock()
+		if r.lastCheck == 0 {
+			atomic.StoreInt64(&r.lastCheck, time.Now().UnixNano())
+		}
+		r.mu.Unlock()
+	}
+	if msgs >= r.maxMsgs || bytes >= r.maxBytes {
+		stopRate := false
+		r.mu.Lock()
+		if r.checkID == id {
+			now := time.Now().UnixNano()
+			delta := time.Duration(now - r.lastCheck)
+			if delta < time.Second {
+				select {
+				case <-time.After(time.Second - delta):
+				case <-c.rateQuit:
+					stopRate = true
+				}
+				atomic.AddInt64(&r.msgs, -msgs)
+				atomic.AddInt64(&r.bytes, -bytes)
+			} else {
+				atomic.AddInt64(&r.msgs, -msgs+1)
+				atomic.AddInt64(&r.bytes, -msgs+msgSize)
+			}
+			atomic.StoreInt64(&r.lastCheck, 0)
+			atomic.StoreUint64(&r.checkID, r.checkID+1)
+		}
+		r.mu.Unlock()
+		if stopRate {
+			c.mu.Lock()
+			c.doRate = false
+			c.mu.Unlock()
 		}
 	}
 }
@@ -1254,6 +1334,12 @@ func (c *client) clearConnection() {
 	}
 	c.nc.Close()
 	c.nc.SetWriteDeadline(time.Time{})
+	if c.doRate {
+		select {
+		case c.rateQuit <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (c *client) typeString() string {

@@ -474,12 +474,41 @@ func TestListenMonitoringDefault(t *testing.T) {
 	}
 }
 
+// Test highly depends on contents of the config file listed below. Any changes to that file
+// may very well break this test.
 func TestMultipleUsersConfig(t *testing.T) {
 	opts, err := ProcessConfigFile("./configs/multiple_users.conf")
 	if err != nil {
 		t.Fatalf("Received an error reading config file: %v\n", err)
 	}
 	processOptions(opts)
+	lu := len(opts.Users)
+	if lu != 2 {
+		t.Fatalf("Expected 2 users, got %d\n", lu)
+	}
+	// Build a map
+	mu := make(map[string]*User)
+	for _, u := range opts.Users {
+		mu[u.Username] = u
+	}
+
+	// Alice
+	alice, ok := mu["alice"]
+	if !ok {
+		t.Fatalf("Expected to see user Alice\n")
+	}
+	if alice.MsgRate != 100 || alice.rate.maxMsgs != 100 || alice.rate.maxBytes != 100*512 {
+		t.Fatalf("Unexpected rate: %#v", alice)
+	}
+
+	// Bob
+	bob, ok := mu["bob"]
+	if !ok {
+		t.Fatalf("Expected to see user Bob\n")
+	}
+	if bob.MsgRate != 0 || bob.rate.maxMsgs != 0 || bob.rate.maxBytes != 0 {
+		t.Fatalf("Unexpected rate: %#v", bob)
+	}
 }
 
 // Test highly depends on contents of the config file listed below. Any changes to that file
