@@ -81,6 +81,7 @@ type Options struct {
 	TLSKey         string        `json:"-"`
 	TLSCaCert      string        `json:"-"`
 	TLSConfig      *tls.Config   `json:"-"`
+	MsgsRate       int           `json:"-"`
 }
 
 // Configuration file authorization section.
@@ -227,6 +228,8 @@ func ProcessConfigFile(configFile string) (*Options, error) {
 				return nil, err
 			}
 			opts.TLSTimeout = tc.Timeout
+		case "msg_rate", "msgs_rate":
+			opts.MsgsRate = int(v.(int64))
 		}
 	}
 	return opts, nil
@@ -649,6 +652,9 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	}
 	if flagOpts.RoutesStr != "" {
 		mergeRoutes(&opts, flagOpts)
+	}
+	if flagOpts.MsgsRate != 0 {
+		opts.MsgsRate = flagOpts.MsgsRate
 	}
 	return &opts
 }

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Allow dynamic profiling.
@@ -44,11 +45,25 @@ type Info struct {
 	clientConnectURLs map[string]struct{}
 }
 
+type rateInfo struct {
+	msgs      int64
+	bytes     int64
+	lastCheck int64
+	checkID   uint64
+	mu        sync.Mutex
+	maxMsgs   int64
+	maxBytes  int64
+	chQuit    chan struct{}
+	done      bool
+}
+
 // Server is our main struct.
 type Server struct {
 	gcid uint64
 	grid uint64
 	stats
+	rate          rateInfo
+	doRate        bool
 	mu            sync.Mutex
 	info          Info
 	infoJSON      []byte
@@ -139,6 +154,14 @@ func New(opts *Options) *Server {
 	s.rcQuit = make(chan bool)
 	s.generateServerInfoJSON()
 	s.handleSignals()
+
+	// Rate limit related settings
+	s.doRate = s.opts.MsgsRate > 0
+	if s.doRate {
+		s.rate.maxMsgs = int64(s.opts.MsgsRate)
+		s.rate.maxBytes = s.rate.maxMsgs * 512
+		s.rate.chQuit = make(chan struct{}, 1)
+	}
 
 	return s
 }
@@ -331,6 +354,11 @@ func (s *Server) Shutdown() {
 
 	// Release the solicited routes connect go routines.
 	close(s.rcQuit)
+
+	// Release possible sleep in rate control
+	if s.doRate {
+		s.rate.chQuit <- struct{}{}
+	}
 
 	s.mu.Unlock()
 
@@ -920,4 +948,46 @@ func (s *Server) getClientConnectURLs() []string {
 		}
 	}
 	return urls
+}
+
+func (s *Server) doRateControl(msgSize int64) {
+	r := &s.rate
+	msgs := atomic.AddInt64(&r.msgs, 1)
+	bytes := atomic.AddInt64(&r.bytes, msgSize)
+	if atomic.LoadInt64(&r.lastCheck) == 0 {
+		r.mu.Lock()
+		if r.lastCheck == 0 {
+			atomic.StoreInt64(&r.lastCheck, time.Now().UnixNano())
+		}
+		r.mu.Unlock()
+	}
+	if msgs >= r.maxMsgs || bytes >= r.maxBytes {
+		id := atomic.LoadUint64(&r.checkID)
+		r.mu.Lock()
+		if r.done {
+			r.mu.Unlock()
+			return
+		}
+		if r.checkID == id {
+			now := time.Now().UnixNano()
+			delta := time.Duration(now - r.lastCheck)
+			if delta < time.Second {
+				select {
+				case <-time.After(time.Second - delta):
+				case <-r.chQuit:
+					r.done = true
+					r.mu.Unlock()
+					return
+				}
+				atomic.AddInt64(&r.msgs, -msgs)
+				atomic.AddInt64(&r.bytes, -bytes)
+			} else {
+				atomic.AddInt64(&r.msgs, -msgs+1)
+				atomic.AddInt64(&r.bytes, -msgs+msgSize)
+			}
+			atomic.StoreInt64(&r.lastCheck, 0)
+			atomic.StoreUint64(&r.checkID, r.checkID+1)
+		}
+		r.mu.Unlock()
+	}
 }

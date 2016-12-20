@@ -116,6 +116,7 @@ func main() {
 	flag.StringVar(&opts.TLSCert, "tlscert", "", "Server certificate file.")
 	flag.StringVar(&opts.TLSKey, "tlskey", "", "Private key for server certificate.")
 	flag.StringVar(&opts.TLSCaCert, "tlscacert", "", "Client certificate CA for verification.")
+	flag.IntVar(&opts.MsgsRate, "msg_rate", 0, "Maximum message rate (server wide)")
 
 	flag.Usage = usage
 

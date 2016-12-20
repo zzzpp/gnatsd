@@ -980,8 +980,9 @@ func (c *client) processMsg(msg []byte) {
 
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.
-	c.cache.inMsgs += 1
-	c.cache.inBytes += len(msg) - LEN_CR_LF
+	msgSize := len(msg) - LEN_CR_LF
+	c.cache.inMsgs++
+	c.cache.inBytes += msgSize
 
 	if c.trace {
 		c.traceMsg(msg)
@@ -1039,6 +1040,10 @@ func (c *client) processMsg(msg []byte) {
 	// Mostly under testing scenarios.
 	if srv == nil {
 		return
+	}
+
+	if srv.doRate {
+		srv.doRateControl(int64(msgSize))
 	}
 
 	var r *SublistResult
@@ -1141,6 +1146,9 @@ func (c *client) processMsg(msg []byte) {
 		// Normal delivery
 		mh := c.msgHeader(msgh[:si], sub)
 		c.deliverMsg(sub, mh, msg)
+		if srv.doRate {
+			srv.doRateControl(int64(msgSize))
+		}
 	}
 
 	// Now process any queue subs we have if not a route
@@ -1158,6 +1166,9 @@ func (c *client) processMsg(msg []byte) {
 			if sub != nil {
 				mh := c.msgHeader(msgh[:si], sub)
 				c.deliverMsg(sub, mh, msg)
+				if srv.doRate {
+					srv.doRateControl(int64(msgSize))
+				}
 			}
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -273,5 +274,107 @@ func TestProcessCommandLineArgs(t *testing.T) {
 	_, _, err = ProcessCommandLineArgs(cmd)
 	if err == nil {
 		t.Errorf("Expected an error handling the command arguments")
+	}
+}
+
+func TestRateLimiting(t *testing.T) {
+	// Rate limited to 100 msgs/sec
+	opts := DefaultOptions
+	opts.MsgsRate = 300
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(fmt.Sprintf("nats://%s:%d",
+		DefaultOptions.Host, DefaultOptions.Port),
+		nats.NoReconnect())
+	if err != nil {
+		t.Fatalf("Error creating client: %v\n", err)
+	}
+
+	msg := []byte("hello")
+	toSend := int32(150)
+	recv := int32(0)
+	ch := make(chan struct{}, 1)
+	cb := func(_ *nats.Msg) {
+		if atomic.AddInt32(&recv, 1) == 2*atomic.LoadInt32(&toSend) {
+			ch <- struct{}{}
+		}
+	}
+	sub1, err := nc.Subscribe("foo", cb)
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	sub2, err := nc.QueueSubscribe("foo", "queue", cb)
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	nc.Flush()
+
+	sendFunc := func(nc *nats.Conn, toSend int32) {
+		for i := 0; i < int(toSend); i++ {
+			if err := nc.Publish("foo", msg); err != nil {
+				return
+			}
+		}
+	}
+
+	go sendFunc(nc, toSend)
+	select {
+	case <-time.After(time.Second):
+	case <-ch:
+		t.Fatal("Rate should have been limited")
+	}
+	start := time.Now()
+	// We send/recv more than the rate allows, so wait for the
+	// rest to arrive.
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed-out waiting for messages")
+	}
+	dur := time.Now().Sub(start)
+	if dur < time.Second {
+		time.Sleep(time.Second - dur + 150*time.Millisecond)
+	}
+	// Reset some vars and send some messages. The total since
+	// last rate limit would make total > rate limit, but we
+	// should not be limited since we waited more than a period.
+	atomic.StoreInt32(&recv, 0)
+	atomic.StoreInt32(&toSend, 60)
+	go sendFunc(nc, toSend)
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("Rate should not have been limited")
+	case <-ch:
+	}
+	sub1.Unsubscribe()
+	sub2.Unsubscribe()
+	nc.Flush()
+	nc.Close()
+
+	// Verify that if blocking in rate limit, shuting down the server
+	// kick it out
+	var ncs [6]*nats.Conn
+	for i := 0; i < len(ncs); i++ {
+		nc, err := nats.Connect(fmt.Sprintf("nats://%s:%d",
+			DefaultOptions.Host, DefaultOptions.Port),
+			nats.NoReconnect())
+		if err != nil {
+			t.Fatalf("Error creating client: %v\n", err)
+		}
+		cnc := nc
+		ncs[i] = cnc
+		go sendFunc(cnc, 100)
+	}
+	// Wait a bit so that we know server is blocking
+	time.Sleep(200 * time.Millisecond)
+	start = time.Now()
+	s.Shutdown()
+	dur = time.Now().Sub(start)
+	if dur > 200*time.Millisecond {
+		t.Fatalf("Shutting down the server took too long: %v", dur)
+	}
+	for _, nc := range ncs {
+		nc.Close()
 	}
 }
